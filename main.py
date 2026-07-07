@@ -1,223 +1,215 @@
 import os
+import json
+import time
+import threading
 import numpy as np
 import neurokit2 as nk
-import firebase_admin
-from firebase_admin import credentials, db
-from flask import Flask, jsonify
+import requests
 from collections import deque
-import threading
-import time
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ── Firebase ──
-if not firebase_admin._apps:
-    cred = credentials.ApplicationDefault()
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': 'https://epiguard-oficial-default-rtdb.firebaseio.com'
-    })
+# ── Configuración Firebase ──
+FIREBASE_SECRET = os.environ.get('FIREBASE_SECRET', '')
+FIREBASE_URL    = 'https://epiguard-oficial-default-rtdb.firebaseio.com'
 
-# ── Configuración ──
-SAMPLING_RATE   = 256      # muestras por segundo del sensor
-MUESTRAS_PAQUETE = 2560    # muestras por paquete (10 segundos)
-PAQUETES_VENTANA = 30      # 30 paquetes = 5 minutos
-MUESTRAS_VENTANA = SAMPLING_RATE * 60 * 5  # 76800 muestras
+# ── Configuración señal ──
+SAMPLING_RATE    = 256
+PAQUETES_VENTANA = 30
+buffer           = deque(maxlen=PAQUETES_VENTANA)
+ultimo_key       = None
+lock             = threading.Lock()
 
-# ── Buffer en memoria ──
-buffer = deque(maxlen=PAQUETES_VENTANA)  # guarda los últimos 30 paquetes
-ultimo_key_procesado = None              # evita procesar el mismo paquete dos veces
-lock = threading.Lock()
-
-# ── Modelo ML (se carga cuando esté listo) ──
+# ── Modelo ML (agregar cuando esté listo) ──
 modelo_ml = None
-# Cuando el modelo esté listo, cárgalo así:
 # import joblib
 # modelo_ml = joblib.load('modelo_epilepsia.pkl')
 
 
-def extraer_variables(ecg_limpio, sampling_rate):
-    """Calcula BPM, HRV y otras variables para el modelo ML."""
+# ════════════════════════════════════════════════
+#  Firebase REST API
+# ════════════════════════════════════════════════
+def firebase_get(ruta):
     try:
-        senales, info = nk.ecg_process(ecg_limpio, sampling_rate=sampling_rate)
+        r = requests.get(
+            f"{FIREBASE_URL}{ruta}.json?auth={FIREBASE_SECRET}",
+            timeout=10
+        )
+        return r.json()
+    except Exception as e:
+        print(f"❌ Error GET Firebase: {e}")
+        return None
 
-        bpm_actual   = float(senales['ECG_Rate'].iloc[-1])
-        bpm_promedio = float(np.nanmean(senales['ECG_Rate']))
+def firebase_set(ruta, datos):
+    try:
+        r = requests.put(
+            f"{FIREBASE_URL}{ruta}.json?auth={FIREBASE_SECRET}",
+            json=datos,
+            timeout=10
+        )
+        return r.json()
+    except Exception as e:
+        print(f"❌ Error SET Firebase: {e}")
+        return None
 
-        hrv   = nk.hrv(info, sampling_rate=sampling_rate)
+
+# ════════════════════════════════════════════════
+#  Procesamiento ECG
+# ════════════════════════════════════════════════
+def extraer_variables(ecg_limpio):
+    try:
+        senales, info = nk.ecg_process(ecg_limpio, sampling_rate=SAMPLING_RATE)
+        bpm_actual    = float(senales['ECG_Rate'].iloc[-1])
+        bpm_promedio  = float(np.nanmean(senales['ECG_Rate']))
+
+        hrv   = nk.hrv(info, sampling_rate=SAMPLING_RATE)
         sdnn  = float(hrv['HRV_SDNN'].values[0])
         rmssd = float(hrv['HRV_RMSSD'].values[0])
         pnn50 = float(hrv['HRV_pNN50'].values[0])
         lf_hf = float(hrv['HRV_LFHF'].values[0]) if 'HRV_LFHF' in hrv.columns else None
 
         return {
-            'bpm':         round(bpm_actual, 1),
-            'bpm_promedio':round(bpm_promedio, 1),
-            'sdnn':        round(sdnn, 2),
-            'rmssd':       round(rmssd, 2),
-            'pnn50':       round(pnn50, 2),
-            'lf_hf':       round(lf_hf, 3) if lf_hf else None,
-            'ok':          True
+            'bpm':          round(bpm_actual, 1),
+            'bpm_promedio': round(bpm_promedio, 1),
+            'sdnn':         round(sdnn, 2),
+            'rmssd':        round(rmssd, 2),
+            'pnn50':        round(pnn50, 2),
+            'lf_hf':        round(lf_hf, 3) if lf_hf else None,
+            'ok':           True
         }
     except Exception as e:
         return {'ok': False, 'error': str(e)}
 
 
 def clasificar(variables):
-    """
-    Clasifica el estado usando el modelo ML.
-    Mientras el modelo no esté listo, usa reglas simples.
-    Retorna: 0 = normal, 1 = alerta leve, 2 = crisis
-    """
+    """0 = normal, 1 = alerta, 2 = crisis"""
     if modelo_ml:
-        # Cuando el modelo esté listo:
-        # features = [variables['bpm'], variables['sdnn'], variables['rmssd'], variables['pnn50'], variables['lf_hf']]
+        # features = [variables['bpm'], variables['sdnn'], variables['rmssd'], variables['pnn50']]
         # return int(modelo_ml.predict([features])[0])
         pass
 
-    # Reglas simples mientras el modelo no está listo
     bpm = variables.get('bpm', 70)
     if bpm > 150 or bpm < 35:
-        return 2  # crisis
+        return 2
     if bpm > 120 or bpm < 45:
-        return 1  # alerta leve
-    return 0      # normal
+        return 1
+    return 0
 
 
 def estado_texto(estado):
     return {0: 'normal', 1: 'alerta', 2: 'crisis'}.get(estado, 'desconocido')
 
 
-def escribir_resultado(variables, estado, paquetes_en_buffer):
-    """Escribe el resultado procesado en Firebase /resultados."""
-    ref = db.reference('/resultados')
-
-    # Señal limpia reducida para graficar (200 puntos)
-    ref.set({
-        'bpm':          variables.get('bpm'),
-        'bpm_promedio': variables.get('bpm_promedio'),
-        'sdnn':         variables.get('sdnn'),
-        'rmssd':        variables.get('rmssd'),
-        'pnn50':        variables.get('pnn50'),
-        'lf_hf':        variables.get('lf_hf'),
-        'estado':       estado,
-        'estado_texto': estado_texto(estado),
-        'calibrando':   False,
-        'paquetes':     paquetes_en_buffer,
-        'timestamp':    int(time.time() * 1000)
-    })
-    print(f"✅ BPM: {variables.get('bpm')} | Estado: {estado_texto(estado)}")
-
-
-def escribir_calibrando(paquetes_actuales):
-    """Escribe estado de calibración en Firebase."""
-    db.reference('/resultados').set({
-        'calibrando':   True,
-        'paquetes':     paquetes_actuales,
-        'total_needed': PAQUETES_VENTANA,
-        'estado':       -1,
-        'estado_texto': 'calibrando',
-        'timestamp':    int(time.time() * 1000)
-    })
-
-
+# ════════════════════════════════════════════════
+#  Lógica principal — ventana deslizante
+# ════════════════════════════════════════════════
 def procesar_nuevo_paquete():
-    """
-    Lee el paquete más reciente de Firebase /sensor,
-    lo agrega al buffer y procesa si hay suficientes datos.
-    """
-    global ultimo_key_procesado
+    global ultimo_key
 
     with lock:
         # Leer último paquete de Firebase
-        ref_sensor = db.reference('/sensor')
-        datos = ref_sensor.order_by_key().limit_to_last(1).get()
+        datos = firebase_get('/sensor')
+        if not datos or not isinstance(datos, dict):
+            return {'ok': False, 'error': 'Sin datos'}
 
-        if not datos:
-            return {'ok': False, 'error': 'Sin datos en Firebase'}
+        # Tomar el último paquete
+        keys    = sorted(datos.keys())
+        key     = keys[-1]
+        paquete = datos[key]
 
-        key    = list(datos.keys())[0]
-        ultimo = list(datos.values())[0]
+        # Evitar reprocesar
+        if key == ultimo_key:
+            return {'ok': False, 'error': 'Ya procesado'}
 
-        # Evitar reprocesar el mismo paquete
-        if key == ultimo_key_procesado:
-            return {'ok': False, 'error': 'Paquete ya procesado'}
-
-        ultimo_key_procesado = key
-        valores = ultimo.get('valores', [])
+        ultimo_key = key
+        valores    = paquete.get('valores', [])
 
         if len(valores) < 100:
             return {'ok': False, 'error': 'Paquete muy pequeño'}
 
-        # Agregar al buffer (deque automáticamente descarta el más viejo)
+        # Agregar al buffer
         buffer.append(np.array(valores, dtype=float))
         paquetes = len(buffer)
+        print(f"📦 Buffer: {paquetes}/{PAQUETES_VENTANA}")
 
-        print(f"📦 Paquete recibido — buffer: {paquetes}/{PAQUETES_VENTANA}")
-
-        # Fase 1: Calibrando (menos de 30 paquetes)
+        # Fase 1: Calibrando
         if paquetes < PAQUETES_VENTANA:
-            escribir_calibrando(paquetes)
+            firebase_set('/resultados', {
+                'calibrando':    True,
+                'paquetes':      paquetes,
+                'total_needed':  PAQUETES_VENTANA,
+                'estado':        -1,
+                'estado_texto':  'calibrando',
+                'timestamp':     int(time.time() * 1000)
+            })
             return {'ok': True, 'calibrando': True, 'paquetes': paquetes}
 
-        # Fase 2 y 3: Ventana completa — procesar
-        ventana = np.concatenate(list(buffer))
-
-        # Normalizar de 0-4095 a milivoltios
-        ecg_mv = (ventana - 2048) / 2048 * 3.3
-
-        # Limpiar señal
+        # Fase 2 y 3: Ventana completa
+        ventana    = np.concatenate(list(buffer))
+        ecg_mv     = (ventana - 2048) / 2048 * 3.3
         ecg_limpio = nk.ecg_clean(ecg_mv, sampling_rate=SAMPLING_RATE)
 
-        # Extraer variables
-        variables = extraer_variables(ecg_limpio, SAMPLING_RATE)
-
+        variables  = extraer_variables(ecg_limpio)
         if not variables['ok']:
             return {'ok': False, 'error': variables.get('error')}
 
-        # Clasificar
         estado = clasificar(variables)
 
-        # Escribir resultado en Firebase
-        escribir_resultado(variables, estado, paquetes)
+        # Señal reducida para graficar (200 puntos)
+        paso         = max(1, len(ecg_limpio) // 200)
+        ecg_para_app = ecg_limpio[::paso].tolist()
 
-        return {
-            'ok':      True,
-            'estado':  estado_texto(estado),
-            'bpm':     variables.get('bpm'),
-            'paquetes': paquetes
+        resultado = {
+            'bpm':          variables['bpm'],
+            'bpm_promedio': variables['bpm_promedio'],
+            'sdnn':         variables['sdnn'],
+            'rmssd':        variables['rmssd'],
+            'pnn50':        variables['pnn50'],
+            'lf_hf':        variables['lf_hf'],
+            'estado':       estado,
+            'estado_texto': estado_texto(estado),
+            'ecg_limpio':   ecg_para_app,
+            'calibrando':   False,
+            'paquetes':     paquetes,
+            'timestamp':    int(time.time() * 1000)
         }
 
+        firebase_set('/resultados', resultado)
+        print(f"✅ BPM: {variables['bpm']} | Estado: {estado_texto(estado)}")
+        return {'ok': True, **resultado}
 
-# ── Loop automático — escucha Firebase en tiempo real ──
-def escuchar_firebase():
-    """
-    Escucha cambios en /sensor y procesa automáticamente
-    cada vez que llega un nuevo paquete.
-    """
-    def on_nuevo_dato(event):
-        if event.data and event.event_type == 'put':
+
+# ════════════════════════════════════════════════
+#  Loop — polling cada 10 segundos
+# ════════════════════════════════════════════════
+def loop_procesamiento():
+    print("🔄 Loop de procesamiento iniciado")
+    while True:
+        try:
             procesar_nuevo_paquete()
+        except Exception as e:
+            print(f"⚠ Error en loop: {e}")
+        time.sleep(10)
 
-    db.reference('/sensor').listen(on_nuevo_dato)
 
-
-# ── Rutas Flask ──
+# ════════════════════════════════════════════════
+#  Rutas Flask
+# ════════════════════════════════════════════════
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({'status': 'EpiGuard Cloud Run OK', 'buffer': len(buffer)})
+    return jsonify({'status': 'EpiGuard OK', 'buffer': len(buffer)})
 
 @app.route('/procesar', methods=['GET', 'POST'])
 def procesar():
-    """Forzar procesamiento manual (útil para pruebas)."""
     resultado = procesar_nuevo_paquete()
     return jsonify(resultado)
 
 @app.route('/estado', methods=['GET'])
 def estado():
-    """Estado actual del buffer."""
     return jsonify({
-        'paquetes_en_buffer': len(buffer),
-        'paquetes_necesarios': PAQUETES_VENTANA,
+        'paquetes':  len(buffer),
+        'necesarios': PAQUETES_VENTANA,
         'calibrando': len(buffer) < PAQUETES_VENTANA
     })
 
@@ -227,10 +219,9 @@ def health():
 
 
 if __name__ == '__main__':
-    # Iniciar escucha de Firebase en hilo separado
-    hilo = threading.Thread(target=escuchar_firebase, daemon=True)
+    # Iniciar loop en hilo separado
+    hilo = threading.Thread(target=loop_procesamiento, daemon=True)
     hilo.start()
-    print("🔥 Escuchando Firebase en tiempo real...")
 
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
