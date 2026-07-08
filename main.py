@@ -10,25 +10,27 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ── Configuración Firebase ──
+# ── Firebase ──
 FIREBASE_SECRET = os.environ.get('FIREBASE_SECRET', '')
 FIREBASE_URL    = 'https://epiguard-oficial-default-rtdb.firebaseio.com'
 
 # ── Configuración señal ──
-SAMPLING_RATE    = 256
-PAQUETES_VENTANA = 30
-buffer           = deque(maxlen=PAQUETES_VENTANA)
-ultimo_key       = None
-lock             = threading.Lock()
+SAMPLING_RATE    = 111     # Hz real del ESP32 (delay 9ms)
+PAQUETES_VENTANA = 30      # 30 paquetes × 10s = 5 minutos
+MUESTRAS_PAQUETE = 1110    # muestras por paquete
 
-# ── Modelo ML (agregar cuando esté listo) ──
+buffer   = deque(maxlen=PAQUETES_VENTANA)
+ultimo_key = None
+lock       = threading.Lock()
+
+# ── Modelo ML ──
 modelo_ml = None
 # import joblib
 # modelo_ml = joblib.load('modelo_epilepsia.pkl')
 
 
 # ════════════════════════════════════════════════
-#  Firebase REST API
+#  Firebase REST
 # ════════════════════════════════════════════════
 def firebase_get(ruta):
     try:
@@ -38,19 +40,18 @@ def firebase_get(ruta):
         )
         return r.json()
     except Exception as e:
-        print(f"❌ Error GET Firebase: {e}")
+        print(f"❌ GET error: {e}")
         return None
 
 def firebase_set(ruta, datos):
     try:
         r = requests.put(
             f"{FIREBASE_URL}{ruta}.json?auth={FIREBASE_SECRET}",
-            json=datos,
-            timeout=10
+            json=datos, timeout=10
         )
         return r.json()
     except Exception as e:
-        print(f"❌ Error SET Firebase: {e}")
+        print(f"❌ SET error: {e}")
         return None
 
 
@@ -60,8 +61,9 @@ def firebase_set(ruta, datos):
 def extraer_variables(ecg_limpio):
     try:
         senales, info = nk.ecg_process(ecg_limpio, sampling_rate=SAMPLING_RATE)
-        bpm_actual    = float(senales['ECG_Rate'].iloc[-1])
-        bpm_promedio  = float(np.nanmean(senales['ECG_Rate']))
+
+        bpm_actual   = float(senales['ECG_Rate'].iloc[-1])
+        bpm_promedio = float(np.nanmean(senales['ECG_Rate']))
 
         hrv   = nk.hrv(info, sampling_rate=SAMPLING_RATE)
         sdnn  = float(hrv['HRV_SDNN'].values[0])
@@ -85,8 +87,9 @@ def extraer_variables(ecg_limpio):
 def clasificar(variables):
     """0 = normal, 1 = alerta, 2 = crisis"""
     if modelo_ml:
-        # features = [variables['bpm'], variables['sdnn'], variables['rmssd'], variables['pnn50']]
-        # return int(modelo_ml.predict([features])[0])
+        # features = [[variables['bpm'], variables['sdnn'],
+        #              variables['rmssd'], variables['pnn50']]]
+        # return int(modelo_ml.predict(features)[0])
         pass
 
     bpm = variables.get('bpm', 70)
@@ -97,28 +100,25 @@ def clasificar(variables):
     return 0
 
 
-def estado_texto(estado):
-    return {0: 'normal', 1: 'alerta', 2: 'crisis'}.get(estado, 'desconocido')
+def estado_texto(e):
+    return {0: 'normal', 1: 'alerta', 2: 'crisis'}.get(e, 'desconocido')
 
 
 # ════════════════════════════════════════════════
-#  Lógica principal — ventana deslizante
+#  Ventana deslizante
 # ════════════════════════════════════════════════
 def procesar_nuevo_paquete():
     global ultimo_key
 
     with lock:
-        # Leer último paquete de Firebase
         datos = firebase_get('/sensor')
         if not datos or not isinstance(datos, dict):
             return {'ok': False, 'error': 'Sin datos'}
 
-        # Tomar el último paquete
         keys    = sorted(datos.keys())
         key     = keys[-1]
         paquete = datos[key]
 
-        # Evitar reprocesar
         if key == ultimo_key:
             return {'ok': False, 'error': 'Ya procesado'}
 
@@ -128,7 +128,6 @@ def procesar_nuevo_paquete():
         if len(valores) < 100:
             return {'ok': False, 'error': 'Paquete muy pequeño'}
 
-        # Agregar al buffer
         buffer.append(np.array(valores, dtype=float))
         paquetes = len(buffer)
         print(f"📦 Buffer: {paquetes}/{PAQUETES_VENTANA}")
@@ -136,28 +135,29 @@ def procesar_nuevo_paquete():
         # Fase 1: Calibrando
         if paquetes < PAQUETES_VENTANA:
             firebase_set('/resultados', {
-                'calibrando':    True,
-                'paquetes':      paquetes,
-                'total_needed':  PAQUETES_VENTANA,
-                'estado':        -1,
-                'estado_texto':  'calibrando',
-                'timestamp':     int(time.time() * 1000)
+                'calibrando':   True,
+                'paquetes':     paquetes,
+                'total_needed': PAQUETES_VENTANA,
+                'estado':       -1,
+                'estado_texto': 'calibrando',
+                'timestamp':    int(time.time() * 1000)
             })
             return {'ok': True, 'calibrando': True, 'paquetes': paquetes}
 
-        # Fase 2 y 3: Ventana completa
+        # Fase 2/3: Ventana completa
         ventana    = np.concatenate(list(buffer))
         ecg_mv     = (ventana - 2048) / 2048 * 3.3
-        ecg_limpio = nk.ecg_clean(ecg_mv, sampling_rate=SAMPLING_RATE)
+        ecg_limpio = nk.ecg_clean(ecg_mv, sampling_rate=SAMPLING_RATE,
+                                   method='neurokit')
 
-        variables  = extraer_variables(ecg_limpio)
+        variables = extraer_variables(ecg_limpio)
         if not variables['ok']:
             return {'ok': False, 'error': variables.get('error')}
 
         estado = clasificar(variables)
 
-        # Señal reducida para graficar (200 puntos)
-        paso         = max(1, len(ecg_limpio) // 200)
+        # Reducir señal a 300 puntos para la app
+        paso         = max(1, len(ecg_limpio) // 300)
         ecg_para_app = ecg_limpio[::paso].tolist()
 
         resultado = {
@@ -176,52 +176,49 @@ def procesar_nuevo_paquete():
         }
 
         firebase_set('/resultados', resultado)
-        print(f"✅ BPM: {variables['bpm']} | Estado: {estado_texto(estado)}")
-        return {'ok': True, **resultado}
+        print(f"✅ BPM: {variables['bpm']} | {estado_texto(estado)}")
+        return {'ok': True, **{k: v for k, v in resultado.items() if k != 'ecg_limpio'}}
 
 
 # ════════════════════════════════════════════════
-#  Loop — polling cada 10 segundos
+#  Loop cada 10 segundos
 # ════════════════════════════════════════════════
 def loop_procesamiento():
-    print("🔄 Loop de procesamiento iniciado")
+    print("🔄 Loop iniciado — procesando cada 10s")
     while True:
         try:
             procesar_nuevo_paquete()
         except Exception as e:
-            print(f"⚠ Error en loop: {e}")
+            print(f"⚠ Error: {e}")
         time.sleep(10)
 
 
 # ════════════════════════════════════════════════
 #  Rutas Flask
 # ════════════════════════════════════════════════
-@app.route('/', methods=['GET'])
+@app.route('/')
 def index():
     return jsonify({'status': 'EpiGuard OK', 'buffer': len(buffer)})
 
 @app.route('/procesar', methods=['GET', 'POST'])
 def procesar():
-    resultado = procesar_nuevo_paquete()
-    return jsonify(resultado)
+    return jsonify(procesar_nuevo_paquete())
 
-@app.route('/estado', methods=['GET'])
+@app.route('/estado')
 def estado():
     return jsonify({
-        'paquetes':  len(buffer),
+        'paquetes':   len(buffer),
         'necesarios': PAQUETES_VENTANA,
         'calibrando': len(buffer) < PAQUETES_VENTANA
     })
 
-@app.route('/health', methods=['GET'])
+@app.route('/health')
 def health():
     return jsonify({'ok': True})
 
 
 if __name__ == '__main__':
-    # Iniciar loop en hilo separado
     hilo = threading.Thread(target=loop_procesamiento, daemon=True)
     hilo.start()
-
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
