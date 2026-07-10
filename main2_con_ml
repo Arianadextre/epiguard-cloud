@@ -1,1 +1,11 @@
 
+backend-epilepsia/
+├── functions/                    # Firebase Cloud Functions
+│   ├── main.py                   # o index.js si usas Node
+│   ├── requirements.txt          # si Python
+│   ├── modelo/
+│   │   └── modelo_crisis_v1.pkl
+│   └── inferencia.py
+├── firebase.json
+├── .firebaserc
+└── README.md
