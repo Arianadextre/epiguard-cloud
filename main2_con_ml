@@ -1,11 +1,19 @@
+# ── Modelo ML ──
+import joblib
 
-backend-epilepsia/
-├── functions/                    # Firebase Cloud Functions
-│   ├── main.py                   # o index.js si usas Node
-│   ├── requirements.txt          # si Python
-│   ├── modelo/
-│   │   └── modelo_crisis_v1.pkl
-│   └── inferencia.py
-├── firebase.json
-├── .firebaserc
-└── README.md
+try:
+    # Carga el nuevo contenedor inteligente
+    contenedor = joblib.load('modelo_crisis_v1.pkl')
+    modelo_ml = contenedor["modelo"]
+    escalador = contenedor["escalador"]
+    columnas_z = contenedor["columnas_features"]
+    umbral_crisis = contenedor["umbral_crisis"]
+    umbral_preictal = contenedor["umbral_preictal"]
+    
+    baselines_paciente = {} 
+    
+    print("✅ Modelo y escalador cargados correctamente")
+except Exception as e:
+    print(f"❌ Error al cargar modelo: {e}")
+    modelo_ml = None
+
