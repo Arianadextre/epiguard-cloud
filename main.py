@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 # ── Firebase ──
 FIREBASE_SECRET = os.environ.get('FIREBASE_SECRET', '')
-FIREBASE_URL    = 'https://epiguard-oficial-default-rtdb.firebaseio.com'
+FIREBASE_URL    = 'https://epiguard2-default-rtdb.firebaseio.com'
 
 # ── Configuración señal ──
 SAMPLING_RATE    = 111
